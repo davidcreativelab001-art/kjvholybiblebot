@@ -170,6 +170,20 @@ NEW_TESTAMENT = ["Matthew","Mark","Luke","John","Acts","Romans","1 Corinthians",
 BOOK_CHAPTERS = {"Genesis":50,"Exodus":40,"Leviticus":27,"Numbers":36,"Deuteronomy":34,"Joshua":24,"Judges":21,"Ruth":4,"1 Samuel":31,"2 Samuel":24,"1 Kings":22,"2 Kings":25,"1 Chronicles":29,"2 Chronicles":36,"Ezra":10,"Nehemiah":13,"Esther":10,"Job":42,"Psalms":150,"Proverbs":31,"Ecclesiastes":12,"Song of Solomon":8,"Isaiah":66,"Jeremiah":52,"Lamentations":5,"Ezekiel":48,"Daniel":12,"Hosea":14,"Joel":3,"Amos":9,"Obadiah":1,"Jonah":4,"Micah":7,"Nahum":3,"Habakkuk":3,"Zephaniah":3,"Haggai":2,"Zechariah":14,"Malachi":4,"Matthew":28,"Mark":16,"Luke":24,"John":21,"Acts":28,"Romans":16,"1 Corinthians":16,"2 Corinthians":13,"Galatians":6,"Ephesians":6,"Philippians":4,"Colossians":4,"1 Thessalonians":5,"2 Thessalonians":3,"1 Timothy":6,"2 Timothy":4,"Titus":3,"Philemon":1,"Hebrews":13,"James":5,"1 Peter":5,"2 Peter":3,"1 John":5,"2 John":1,"3 John":1,"Jude":1,"Revelation":22}
 BOOKS = OLD_TESTAMENT + NEW_TESTAMENT  # all 66 books
 
+AUDIO_BASE = "https://audiotreasure.com/content/KJV_AT"  # free KJV audio, one MP3 per chapter (verified live for 65 of 66 books)
+AUDIO_NO_SUFFIX = {"Philemon", "2 John", "3 John", "Jude"}  # single-chapter books are one file, no chapter suffix
+def audio_url(book: str, chapter) -> str | None:
+    if book not in BOOK_CHAPTERS: return None
+    n = BOOKS.index(book) + 1; name = book.replace(" ", "")
+    if book in AUDIO_NO_SUFFIX: return f"{AUDIO_BASE}/{n:02d}_{name}.mp3"
+    return f"{AUDIO_BASE}/{n:02d}_{name}{int(chapter):03d}.mp3"
+
+async def audio_exists(url: str) -> bool:
+    try:
+        s = await http()
+        async with s.head(url, allow_redirects=True) as r: return r.status == 200
+    except Exception: return False
+
 def split_long(text: str, size: int = 3800) -> list[str]:
     parts = []
     while len(text) > size:
@@ -199,8 +213,8 @@ async def fetch_reference(ref: str, translation: str = "kjv") -> str | None:
         async with s.get(f"https://bible-api.com/{ref.replace(' ', '+')}?translation={translation}") as r:
             if r.status != 200: return None
             d = await r.json()
-            verses = " ".join(v["text"].strip() for v in d.get("verses", []))
-            return f"📖 <b>{html.escape(d.get('reference', ref))}</b> ({translation.upper()})\n\n{html.escape(verses)}" if verses else None
+            verses = " ".join(f"<b>{v.get('verse', '')}</b> {html.escape(v['text'].strip())}" for v in d.get("verses", []) if v.get("text"))
+            return f"📖 <b>{html.escape(d.get('reference', ref))}</b> ({translation.upper()})\n\n{verses}" if verses else None
     except Exception as e:
         log.warning("bible-api failed: %s", e); return None
 
@@ -371,9 +385,23 @@ async def cb_chapter(cb: CallbackQuery, state: FSMContext):
     if not out:
         await cb.message.answer("Sorry, I couldn't load that chapter right now. Please try again.", reply_markup=back_menu()); await cb.answer(); return
     nav = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔊 Listen to {book} {chapter}", callback_data=f"audio:{book}:{chapter}")],
         [InlineKeyboardButton(text="📚 More chapters of this book", callback_data=f"book:{book}")],
         [InlineKeyboardButton(text="⬅️ Main Menu", callback_data="m:menu")]])
     await send_long(cb.message, out, last_markup=nav); await cb.answer()
+
+@router.callback_query(F.data.startswith("audio:"))
+async def cb_audio(cb: CallbackQuery):
+    parts = cb.data.split(":"); chapter = parts[-1]; book = ":".join(parts[1:-1])
+    url = audio_url(book, chapter)
+    await cb.answer("Loading the audio…")
+    if not url or not await audio_exists(url):
+        await cb.message.answer(f"🔇 Sorry, audio isn't available for {html.escape(book)} {html.escape(chapter)} yet — please enjoy reading the chapter above.", reply_markup=back_menu()); return
+    try:
+        await cb.message.answer_audio(url, caption=f"🔊 <b>{html.escape(book)} {html.escape(chapter)}</b> — King James Version", title=f"{book} {chapter} (KJV)", performer="KJV Audio Bible")
+    except Exception as e:
+        log.warning("audio send failed: %s", e)
+        await cb.message.answer("🔇 The audio couldn't be sent just now — please try again in a moment.", reply_markup=back_menu())
 
 @router.message(Form.read_ref)
 async def do_read(m: Message, state: FSMContext):
@@ -384,7 +412,16 @@ async def do_read(m: Message, state: FSMContext):
     await state.clear()
     out = await fetch_reference(ref, "kjv")
     if not out: await m.answer("Sorry, I couldn't load that chapter. Try e.g. <code>John 1</code>.", reply_markup=back_menu()); return
-    await send_long(m, out, last_markup=back_menu())
+    markup = back_menu()
+    mm = REF_RE.match(ref)
+    if mm and not mm.group(3):  # a whole chapter, not a verse range — offer audio
+        book_name = " ".join(mm.group(1).split()).title() if not mm.group(1)[0].isdigit() else mm.group(1).strip()
+        book_name = {"Psalm": "Psalms"}.get(book_name, book_name)
+        if book_name in BOOK_CHAPTERS:
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"🔊 Listen to {book_name} {mm.group(2)}", callback_data=f"audio:{book_name}:{mm.group(2)}")],
+                [InlineKeyboardButton(text="⬅️ Main Menu", callback_data="m:menu")]])
+    await send_long(m, out, last_markup=markup)
 
 @router.callback_query(F.data == "m:topics")
 async def cb_topics(cb: CallbackQuery):
