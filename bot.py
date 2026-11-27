@@ -61,6 +61,8 @@ def init_db():
         """)
     try: c.execute("ALTER TABLE users ADD COLUMN language TEXT")
     except Exception: pass
+    try: c.execute("ALTER TABLE users ADD COLUMN text_size INTEGER DEFAULT 0")
+    except Exception: pass
 
 def upsert_user(u):
     now = datetime.now(TZ).isoformat(timespec="seconds")
@@ -193,7 +195,8 @@ async def audio_exists(url: str) -> bool:
 def split_long(text: str, size: int = 3800) -> list[str]:
     parts = []
     while len(text) > size:
-        cut = text.rfind(" ", 0, size)
+        cut = text.rfind("\n", 0, size)
+        if cut < size // 2: cut = text.rfind(" ", 0, size)
         if cut < size // 2: cut = size
         parts.append(text[:cut].strip()); text = text[cut:].strip()
     if text: parts.append(text)
@@ -213,14 +216,14 @@ async def http():
         _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)); _http_loop = loop
     return _http
 
-async def fetch_reference(ref: str, translation: str = "kjv") -> str | None:
+async def fetch_reference(ref: str, translation: str = "kjv", size: int = 0) -> str | None:
     s = await http()
     try:
         async with s.get(f"https://bible-api.com/{ref.replace(' ', '+')}?translation={translation}") as r:
             if r.status != 200: return None
             d = await r.json()
-            verses = " ".join(f"<b>{v.get('verse', '')}</b> {html.escape(v['text'].strip())}" for v in d.get("verses", []) if v.get("text"))
-            return f"📖 <b>{html.escape(d.get('reference', ref))}</b> ({translation.upper()})\n\n{verses}" if verses else None
+            verses = [(v.get("verse"), v["text"].strip()) for v in d.get("verses", []) if v.get("text")]
+            return f"📖 <b>{html.escape(d.get('reference', ref))}</b> ({translation.upper()})\n\n{verse_body(verses, size)}" if verses else None
     except Exception as e:
         log.warning("bible-api failed: %s", e); return None
 
@@ -261,6 +264,45 @@ def get_lang(uid) -> str:
 def needs_lang_choice(uid) -> bool:
     u = get_user(uid)
     return bool(u) and (u["language"] if "language" in u.keys() else None) is None
+
+def get_text_size(uid) -> int:
+    u = get_user(uid)
+    v = (u["text_size"] if u and "text_size" in u.keys() else 0) or 0
+    return v if v in (0, 1, 2) else 0
+
+def _big(text: str) -> str:
+    """Render Latin text in Unicode sans-serif bold — visibly larger/heavier in Telegram
+    (bots cannot set a true font size; this is the closest rendering Telegram allows)."""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if 65 <= o <= 90: out.append(chr(0x1D5D4 + o - 65))
+        elif 97 <= o <= 122: out.append(chr(0x1D5EE + o - 97))
+        elif 48 <= o <= 57: out.append(chr(0x1D7EC + o - 48))
+        else: out.append(ch)
+    return "".join(out)
+
+def verse_body(verses, size: int = 0) -> str:
+    """One verse per line, numbered 1. 2. 3. — Large adds spacing + big rendering,
+    Extra Large also puts the number on its own line."""
+    lines = []
+    for n, t in verses:
+        tt = html.escape(_big(t) if size else t)
+        num = _big(f"{n}.") if size else f"{n}."
+        lines.append(f"<b>{num}</b>\n{tt}" if size >= 2 else f"<b>{num}</b> {tt}")
+    return ("\n" if size == 0 else "\n\n").join(lines)
+
+SIZE_STR = {
+ "en": ("Text size", ["Normal", "Large", "Extra Large"]),
+ "fr": ("Taille du texte", ["Normale", "Grande", "Très grande"]),
+ "hi": ("अक्षरों का आकार", ["सामान्य", "बड़ा", "बहुत बड़ा"]),
+ "ha": ("Girman rubutu", ["Na yau da kullum", "Babba", "Babba sosai"]),
+ "yo": ("Ìwọ̀n ọ̀rọ̀", ["Déédé", "Ńlá", "Ńlá gan-an"]),
+ "ar": ("حجم النص", ["عادي", "كبير", "كبير جداً"]),
+}
+def size_btn_text(lang, size):
+    label, names = SIZE_STR.get(lang, SIZE_STR["en"])
+    return f"🔠 {label}: {names[size]}"
 
 def T(lang, key, **kw):
     s = STR.get(lang, STR["en"]).get(key) or STR["en"].get(key, key)
@@ -749,7 +791,7 @@ DEV_I18N = {
 def dev_for(lang): return DEV_I18N.get(lang, DEVOTIONALS)
 
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "").strip()     # e.g. a Paystack/Flutterwave payment link
-SUPPORT_DETAILS = os.getenv("SUPPORT_DETAILS", "").strip()  # e.g. bank name + account number, shown on the Support screen
+SUPPORT_DETAILS = os.getenv("SUPPORT_DETAILS", "").strip() or "🏦 Zenith Bank\nAccount number: 2251316372\nAccount name: David Sunday Victor"
 
 # ---------------------------------------------------------------- multilingual Bible fetch
 def normalize_book(name: str):
@@ -809,21 +851,20 @@ async def chapter_verses(book: str, chapter: int, lang: str):
         log.warning("chapter fetch failed (%s %s %s): %s", lang, book, chapter, e); return None
     return None
 
-def _format_verses(book_disp: str, chapter: int, verses, lang: str, v_from=None, v_to=None) -> str:
+def _format_verses(book_disp: str, chapter: int, verses, lang: str, v_from=None, v_to=None, size: int = 0) -> str:
     sel = [(n, t) for (n, t) in verses if (v_from is None or n >= v_from) and (v_to is None or n <= v_to)]
     if not sel: return None
     ref = f"{book_disp} {chapter}" + ("" if v_from is None else (f":{v_from}" if (v_to is None or v_to == v_from) else f":{v_from}-{v_to}"))
-    body = " ".join(f"<b>{n}</b> {html.escape(t)}" for (n, t) in sel)
-    return f"📖 <b>{html.escape(ref)}</b> ({html.escape(LANGS[lang]['version'])})\n\n{body}"
+    return f"📖 <b>{html.escape(ref)}</b> ({html.escape(LANGS[lang]['version'])})\n\n{verse_body(sel, size)}"
 
-async def fetch_chapter_text(book: str, chapter: int, lang: str):
+async def fetch_chapter_text(book: str, chapter: int, lang: str, size: int = 0):
     verses = await chapter_verses(book, int(chapter), lang)
     if not verses: return None
-    return _format_verses(await book_display(lang, book), int(chapter), verses, lang)
+    return _format_verses(await book_display(lang, book), int(chapter), verses, lang, size=size)
 
-async def fetch_any(ref: str, lang: str):
+async def fetch_any(ref: str, lang: str, size: int = 0):
     """Fetch any typed reference ('John 3:16', 'Psalms 23', '1 John 1:9') in the user's language."""
-    if lang == "en": return await fetch_reference(ref, "kjv")
+    if lang == "en": return await fetch_reference(ref, "kjv", size)
     mm = REF_RE.match(ref or "")
     if not mm: return None
     book = normalize_book(mm.group(1))
@@ -831,7 +872,7 @@ async def fetch_any(ref: str, lang: str):
     chapter = int(mm.group(2)); v1 = int(mm.group(3)) if mm.group(3) else None; v2 = int(mm.group(4)) if mm.group(4) else v1
     verses = await chapter_verses(book, chapter, lang)
     if not verses: return None
-    return _format_verses(await book_display(lang, book), chapter, verses, lang, v1, v2)
+    return _format_verses(await book_display(lang, book), chapter, verses, lang, v1, v2, size=size)
 
 async def keyword_search_lang(query: str, lang: str, limit: int = 5) -> list:
     code = {"en": "KJV", "fr": "FRLSG", "ar": "SVD", "hi": "HIOV"}.get(lang)
@@ -901,7 +942,7 @@ async def on_start(m: Message, state: FSMContext):
     lang = get_lang(m.from_user.id)
     ref, txt = daily_verse()
     if lang != "en":
-        got = await fetch_any(ref, lang)
+        got = await fetch_any(ref, lang, get_text_size(m.from_user.id))
         verse_block = got or f"🌅 <b>{T(lang, 'verse_day')} — {html.escape(ref)}</b>\n{html.escape(txt)}"
     else:
         verse_block = f"🌅 <b>{T(lang, 'verse_day')} — {html.escape(ref)}</b>\n{html.escape(txt)}"
@@ -921,7 +962,7 @@ async def on_help(m: Message):
 async def on_verse_cmd(m: Message):
     lang = get_lang(m.from_user.id); ref, txt = daily_verse()
     if lang != "en":
-        got = await fetch_any(ref, lang)
+        got = await fetch_any(ref, lang, get_text_size(m.from_user.id))
         if got: await m.answer(got, reply_markup=back_menu(lang)); return
     await m.answer(f"🌅 <b>{T(lang, 'verse_day')} — {html.escape(ref)}</b>\n\n{html.escape(txt)}", reply_markup=back_menu(lang))
 
@@ -986,7 +1027,7 @@ async def do_support_note(m: Message, state: FSMContext, bot: Bot):
 async def cb_daily(cb: CallbackQuery):
     lang = get_lang(cb.from_user.id); ref, txt = daily_verse()
     if lang != "en":
-        got = await fetch_any(ref, lang)
+        got = await fetch_any(ref, lang, get_text_size(cb.from_user.id))
         if got:
             try: await cb.message.edit_text(got, reply_markup=back_menu(lang))
             except Exception: await cb.message.answer(got, reply_markup=back_menu(lang))
@@ -1016,7 +1057,7 @@ async def do_search(m: Message, state: FSMContext):
     if not q: return
     await state.clear()
     if REF_RE.match(q):
-        out = await fetch_any(q, lang)
+        out = await fetch_any(q, lang, get_text_size(m.from_user.id))
         await m.answer(out or T(lang, "search_fail"), reply_markup=back_menu(lang)); return
     results = await keyword_search_lang(q, lang)
     if not results:
@@ -1024,7 +1065,7 @@ async def do_search(m: Message, state: FSMContext):
         if key:
             parts = []
             for (ref,) in TOPICS[key]:
-                got = await fetch_any(ref, lang)
+                got = await fetch_any(ref, lang, get_text_size(m.from_user.id))
                 if got: parts.append(got)
             results = parts
     if results: await m.answer("\n\n".join(results), reply_markup=back_menu(lang)); return
@@ -1096,8 +1137,9 @@ async def cb_chpage(cb: CallbackQuery):
 async def cb_chapter(cb: CallbackQuery, state: FSMContext):
     parts = cb.data.split(":"); chapter = parts[-1]; book = ":".join(parts[1:-1]); lang = get_lang(cb.from_user.id)
     await state.clear()
-    out = await fetch_chapter_text(book, int(chapter), lang)
-    if not out and lang != "en": out = await fetch_chapter_text(book, int(chapter), "en")  # fallback to KJV if a source hiccups
+    sz = get_text_size(cb.from_user.id)
+    out = await fetch_chapter_text(book, int(chapter), lang, sz)
+    if not out and lang != "en": out = await fetch_chapter_text(book, int(chapter), "en", sz)  # fallback to KJV if a source hiccups
     if not out:
         await cb.message.answer(T(lang, "chapter_fail"), reply_markup=back_menu(lang)); await cb.answer(); return
     disp = await book_display(lang, book)
@@ -1128,7 +1170,7 @@ async def do_read(m: Message, state: FSMContext):
     if not REF_RE.match(ref):
         await m.answer(T(lang, "type_ref_hint")); return
     await state.clear()
-    out = await fetch_any(ref, lang)
+    out = await fetch_any(ref, lang, get_text_size(m.from_user.id))
     if not out: await m.answer(T(lang, "read_fail"), reply_markup=back_menu(lang)); return
     markup = back_menu(lang)
     mm = REF_RE.match(ref)
@@ -1155,7 +1197,7 @@ async def cb_topic(cb: CallbackQuery):
     key = cb.data.split(":", 1)[1]; lang = get_lang(cb.from_user.id)
     parts = []
     for (ref,) in TOPICS.get(key, []):
-        got = await fetch_any(ref, lang)
+        got = await fetch_any(ref, lang, get_text_size(cb.from_user.id))
         if got: parts.append(got)
     text = "\n\n".join(parts) if parts else T(lang, "topics_fail")
     try: await cb.message.edit_text(text, reply_markup=back_menu(lang))
@@ -1166,7 +1208,7 @@ async def _render_dev(cb: CallbackQuery, day: int):
     lang = get_lang(cb.from_user.id); devs = dev_for(lang)
     day %= len(devs)
     title, ref, body, prayer = devs[day]
-    verse = await fetch_any(ref, lang)
+    verse = await fetch_any(ref, lang, get_text_size(cb.from_user.id))
     rows = [[InlineKeyboardButton(text=T(lang, "prev_day"), callback_data=f"dev:{(day-1) % len(devs)}"),
              InlineKeyboardButton(text=T(lang, "next_day"), callback_data=f"dev:{(day+1) % len(devs)}")],
             [InlineKeyboardButton(text=T(lang, "back"), callback_data="m:menu")]]
@@ -1241,6 +1283,7 @@ async def cb_settings(cb: CallbackQuery):
     user = get_user(cb.from_user.id); lang = get_lang(cb.from_user.id)
     daily = (user["daily_optin"] if user else 1)
     rows = [[InlineKeyboardButton(text=T(lang, "daily_toggle", state=T(lang, "on") if daily else T(lang, "off")), callback_data="set:daily")],
+            [InlineKeyboardButton(text=size_btn_text(lang, get_text_size(cb.from_user.id)), callback_data="set:size")],
             [InlineKeyboardButton(text=f"🌐 {T(lang, 'lang_btn')}: {LANGS[lang]['native']}", callback_data="m:lang")],
             [InlineKeyboardButton(text=T(lang, "back"), callback_data="m:menu")]]
     text = f"{T(lang, 'settings_title')}\n\n{T(lang, 'version_line', version=html.escape(LANGS[lang]['version']))}"
@@ -1253,6 +1296,8 @@ async def cb_set(cb: CallbackQuery):
     parts = cb.data.split(":")
     if parts[1] == "daily":
         user = get_user(cb.from_user.id); set_user(cb.from_user.id, "daily_optin", 0 if (user and user["daily_optin"]) else 1)
+    elif parts[1] == "size":
+        set_user(cb.from_user.id, "text_size", (get_text_size(cb.from_user.id) + 1) % 3)
     await cb_settings(cb)
 
 # --- plain text: treat as search / reference
@@ -1261,12 +1306,12 @@ async def catch_all(m: Message):
     upsert_user(m.from_user)
     q = m.text.strip(); lang = get_lang(m.from_user.id)
     if REF_RE.match(q):
-        out = await fetch_any(q, lang); await m.answer(out or T(lang, "search_fail"), reply_markup=back_menu(lang)); return
+        out = await fetch_any(q, lang, get_text_size(m.from_user.id)); await m.answer(out or T(lang, "search_fail"), reply_markup=back_menu(lang)); return
     key = _topic_key_for(q)
     if key:
         parts = []
         for (ref,) in TOPICS[key]:
-            got = await fetch_any(ref, lang)
+            got = await fetch_any(ref, lang, get_text_size(m.from_user.id))
             if got: parts.append(got)
         if parts: await m.answer("\n\n".join(parts), reply_markup=back_menu(lang)); return
     await m.answer(T(lang, "not_understood"), reply_markup=main_menu(lang))
@@ -1346,15 +1391,18 @@ async def daily_job(bot: Bot):
             if now.hour == DAILY_HOUR and meta_get("last_daily") != today:
                 meta_set("last_daily", today)
                 ref, txt = daily_verse(now.date())
-                with db() as c: rows_ = c.execute("SELECT user_id, language FROM users WHERE daily_optin=1").fetchall()
+                with db() as c: rows_ = c.execute("SELECT user_id, language, text_size FROM users WHERE daily_optin=1").fetchall()
                 by_lang = {}
-                for r in rows_: by_lang.setdefault((r["language"] or "en") if r["language"] in LANGS else "en", []).append(r["user_id"])
+                for r in rows_:
+                    lg = (r["language"] or "en") if r["language"] in LANGS else "en"
+                    sz = r["text_size"] if r["text_size"] in (0, 1, 2) else 0
+                    by_lang.setdefault((lg, sz), []).append(r["user_id"])
                 total = 0
-                for lang, ids in by_lang.items():
+                for (lang, sz), ids in by_lang.items():
                     if lang == "en":
-                        body = f"🌅 <b>{T('en', 'verse_day')} — {html.escape(ref)}</b>\n\n{html.escape(txt)}"
+                        body = f"🌅 <b>{T('en', 'verse_day')} — {html.escape(ref)}</b>\n\n{html.escape(_big(txt) if sz else txt)}"
                     else:
-                        body = await fetch_any(ref, lang) or f"🌅 <b>{T(lang, 'verse_day')} — {html.escape(ref)}</b>\n\n{html.escape(txt)}"
+                        body = await fetch_any(ref, lang, sz) or f"🌅 <b>{T(lang, 'verse_day')} — {html.escape(ref)}</b>\n\n{html.escape(txt)}"
                     for uid in ids:
                         try: await bot.send_message(uid, body + "\n\n" + T(lang, "daily_tail"))
                         except Exception: pass
